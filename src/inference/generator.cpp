@@ -1,6 +1,7 @@
+// src/inference/generator.cpp
 #include "inference/generator.h"
 #include "inference/forward.h"
-#include "model/model_loader.h"    // <-- ДОБАВЛЕНО для полного определения Model
+#include "model/model_loader.h"
 #include "model/tensor_ops.h"
 #include "inference/sampler.h"
 #include "model/tokenizer.h"
@@ -44,7 +45,8 @@ GenerateResult generate(Model *m, RunState *s,
                         const int *prompt, int plen,
                         int max_new, float temp, int top_k,
                         float top_p, float rep_p,
-                        bool ignore_eos, bool streaming) {
+                        bool ignore_eos, bool streaming,
+                        std::atomic<bool> *stop_flag) {
     GenerateResult result;
     result.prompt_tokens = plen;
 
@@ -57,6 +59,13 @@ GenerateResult generate(Model *m, RunState *s,
     double t0 = time_sec();
     forward_batch(m, s, prompt, 0, plen);
     result.prefill_time = time_sec() - t0;
+
+    // Check stop after prefill
+    if (stop_flag && stop_flag->load()) {
+        result.finish_reason = "stop";
+        result.gen_time = 0;
+        return result;
+    }
 
     int pos = plen;
 
@@ -83,6 +92,12 @@ GenerateResult generate(Model *m, RunState *s,
     double t_gen_start = time_sec();
 
     for (int i = 1; i < max_new; i++) {
+        // Check stop flag
+        if (stop_flag && stop_flag->load()) {
+            result.finish_reason = "stop";
+            break;
+        }
+
         if (!ignore_eos && next == m->tok.eos_id) { result.finish_reason = "eos"; break; }
         if (pos >= m->cfg.max_seq_len - 1)        { result.finish_reason = "max_context"; break; }
 
@@ -107,6 +122,99 @@ GenerateResult generate(Model *m, RunState *s,
         tok_decode_one(&m->tok, next, buf, sizeof(buf));
         result.text += buf;
         if (streaming) { printf("%s", buf); fflush(stdout); }
+        result.generated_tokens++;
+    }
+
+    result.gen_time = time_sec() - t_gen_start;
+    return result;
+}
+
+GenerateResult generate_streaming(Model *m, RunState *s,
+                                  const int *prompt, int plen,
+                                  int max_new, float temp, int top_k,
+                                  float top_p, float rep_p,
+                                  bool ignore_eos,
+                                  const std::function<void(int,const char*)> &on_token,
+                                  std::atomic<bool> *stop_flag) {
+    GenerateResult result;
+    result.prompt_tokens = plen;
+
+    std::vector<int> history(prompt, prompt + plen);
+    history.reserve(plen + max_new);
+
+    bool is_greedy = (temp < 1e-6f);
+    bool no_rep    = (fabsf(rep_p - 1.0f) < 1e-6f);
+
+    double t0 = time_sec();
+    forward_batch(m, s, prompt, 0, plen);
+    result.prefill_time = time_sec() - t0;
+
+    // Check stop after prefill
+    if (stop_flag && stop_flag->load()) {
+        result.finish_reason = "stop";
+        result.gen_time = 0;
+        return result;
+    }
+
+    int pos = plen;
+
+    if (!no_rep)
+        apply_repetition_penalty(s->logits, m->cfg.vocab_size,
+                                 history.data(), (int)history.size(), rep_p);
+
+    int next;
+    if (is_greedy) {
+        next = 0;
+        for (int i = 1; i < m->cfg.vocab_size; i++)
+            if (s->logits[i] > s->logits[next]) next = i;
+    } else {
+        next = sample_token(s->logits, m->cfg.vocab_size, temp, top_k, top_p);
+    }
+
+    history.push_back(next);
+    char buf[256];
+    tok_decode_one(&m->tok, next, buf, sizeof(buf));
+    result.text += buf;
+    on_token(next, buf);
+    result.generated_tokens++;
+
+    double t_gen_start = time_sec();
+
+    for (int i = 1; i < max_new; i++) {
+        // Check stop flag
+        if (stop_flag && stop_flag->load()) {
+            result.finish_reason = "stop";
+            break;
+        }
+
+        if (!ignore_eos && next == m->tok.eos_id) { 
+            result.finish_reason = "eos"; break; 
+        }
+        if (pos >= m->cfg.max_seq_len - 1) { 
+            result.finish_reason = "max_context"; break; 
+        }
+
+        if (is_greedy && no_rep) {
+            forward_transformer(m, s, next, pos++);
+            next = wt_matmul_argmax(&m->lm_head, s->x);
+        } else {
+            forward(m, s, next, pos++);
+            if (!no_rep)
+                apply_repetition_penalty(s->logits, m->cfg.vocab_size,
+                                         history.data(), (int)history.size(), rep_p);
+            if (is_greedy) {
+                next = 0;
+                for (int j = 1; j < m->cfg.vocab_size; j++)
+                    if (s->logits[j] > s->logits[next]) next = j;
+            } else {
+                next = sample_token(s->logits, m->cfg.vocab_size, temp, top_k, top_p);
+            }
+        }
+
+        history.push_back(next);
+        tok_decode_one(&m->tok, next, buf, sizeof(buf));
+        result.text += buf;
+        on_token(next, buf);
         result.generated_tokens++;
     }
 
