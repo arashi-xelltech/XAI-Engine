@@ -1,5 +1,7 @@
 #pragma once
 #include <string>
+#include <atomic>
+#include <functional>
 
 namespace xai {
 
@@ -19,7 +21,8 @@ GenerateResult generate(Model *m, RunState *s,
                         const int *prompt, int plen,
                         int max_new, float temp, int top_k,
                         float top_p, float rep_p,
-                        bool ignore_eos, bool streaming);
+                        bool ignore_eos, bool streaming,
+                        std::atomic<bool> *stop_flag = nullptr);
 
 // Timing helper
 double time_sec();
@@ -32,5 +35,14 @@ void json_print_escaped(FILE *f, const char *s);
 void print_result_json(const GenerateResult &r, const char *prompt);
 void print_result_text(const GenerateResult &r);
 std::string build_json_response(const GenerateResult &r, const std::string &prompt);
+
+
+GenerateResult generate_streaming(Model *m, RunState *s,
+    const int *prompt, int plen,
+    int max_new, float temp, int top_k,
+    float top_p, float rep_p,
+    bool ignore_eos,
+    const std::function<void(int,const char*)> &on_token,
+    std::atomic<bool> *stop_flag = nullptr);
 
 } // namespace xai
