@@ -26,11 +26,14 @@
 #include "core/config.h"
 #include "core/thread_pool.h"
 #include "model/model_loader.h"
-#include "model/tensor_ops.h"      // <-- ДОБАВЛЕНО для wt_matmul_argmax
+#include "model/tensor_ops.h"     
 #include "model/tokenizer.h"
 #include "inference/forward.h"
 #include "inference/generator.h"
 #include "inference/sampler.h"
+#include "core/webui.h"
+
+
 
 using namespace xai;
 
@@ -43,12 +46,14 @@ int xai::g_sliding_window = 0;
 
 struct ServerRequest {
     std::string prompt;
+    std::string request_id;
     int   max_tokens  = 256;
     float temperature = 0.8f;
     int   top_k       = 50;
     float top_p       = 0.9f;
     float rep_p       = 1.1f;
     bool  ignore_eos  = false;
+    bool  stream      = false;
     uint64_t seed     = 42;
     bool  seed_set    = false;
 };
@@ -135,6 +140,16 @@ static ServerRequest parse_server_request(const char *json, int len) {
         else if (!strcmp(k,"top_k"))       req.top_k       = (int)jp_num(&j);
         else if (!strcmp(k,"top_p"))       req.top_p       = (float)jp_num(&j);
         else if (!strcmp(k,"rep_p"))       req.rep_p       = (float)jp_num(&j);
+        else if (!strcmp(k,"stream")) {        
+            jp_ws(&j);
+            if (j.d[j.p]=='t'||j.d[j.p]=='T') {
+                req.stream = true;
+                while (j.p<j.len && j.d[j.p]!=','&&j.d[j.p]!='}') j.p++;
+            } else if (j.d[j.p]=='f'||j.d[j.p]=='F') {
+                req.stream = false;
+                while (j.p<j.len && j.d[j.p]!=','&&j.d[j.p]!='}') j.p++;
+            } else req.stream = (int)jp_num(&j) != 0;
+        }
         else if (!strcmp(k,"ignore_eos")) {
             jp_ws(&j);
             if (j.d[j.p]=='t'||j.d[j.p]=='T') {
@@ -146,6 +161,10 @@ static ServerRequest parse_server_request(const char *json, int len) {
             } else req.ignore_eos = (int)jp_num(&j) != 0;
         }
         else if (!strcmp(k,"seed")) { req.seed=(uint64_t)jp_num(&j); req.seed_set=true; }
+        else if (!strcmp(k,"request_id")) { 
+            char *s = jp_str(&j); 
+            if(s) { req.request_id = s; free(s); } 
+        }
         else jp_skip(&j);
 
         free(k); jp_ws(&j);
@@ -166,6 +185,13 @@ struct ServerWorkItem {
     std::string client_ip;
     ServerRequest request;
 };
+
+#include <unordered_map>
+#include <unordered_set>
+
+static std::mutex g_stop_mutex;
+static std::unordered_map<std::string, std::atomic<bool>*> g_stop_flags;
+static std::unordered_set<std::string> g_stop_ids;
 
 class ServerWorkerPool {
 public:
@@ -205,7 +231,14 @@ private:
                 queue_.pop();
             }
 
-            // Выполняем генерацию
+            // Создаём флаг остановки для этого запроса
+            std::atomic<bool> stop_flag{false};
+            std::string req_id = item.request.request_id;
+            if (!req_id.empty()) {
+                std::lock_guard<std::mutex> lock(g_stop_mutex);
+                g_stop_flags[req_id] = &stop_flag;
+            }
+
             RunState s;
             alloc_state(&s, &model_->cfg);
 
@@ -214,32 +247,85 @@ private:
 
             int ids[MAX_SEQ_LEN];
             int n = tok_encode(&model_->tok, item.request.prompt.c_str(),
-                               ids, MAX_SEQ_LEN, 0);
+                            ids, MAX_SEQ_LEN, 0);
             double ts0 = time_sec();
-            auto r = generate(model_, &s, ids, n, item.request.max_tokens,
-                              item.request.temperature, item.request.top_k,
-                              item.request.top_p, item.request.rep_p,
-                              item.request.ignore_eos, false);
 
-            std::string resp = build_json_response(r, item.request.prompt);
+            if (item.request.stream) {
+                const char *sse_header =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: keep-alive\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "\r\n";
+                write(item.client_fd, sse_header, strlen(sse_header));
+
+                auto r = generate_streaming(model_, &s, ids, n, 
+                                        item.request.max_tokens,
+                                        item.request.temperature, 
+                                        item.request.top_k,
+                                        item.request.top_p, 
+                                        item.request.rep_p,
+                                        item.request.ignore_eos,
+                                        [&](int token, const char *text) {
+                    char buf[1024];
+                    std::string escaped = json_escape(text);
+                    snprintf(buf, sizeof(buf), 
+                            "data: {\"token\":%d,\"text\":\"%s\"}\n\n",
+                            token, escaped.c_str());
+                    write(item.client_fd, buf, strlen(buf));
+                },
+                &stop_flag);  // ← ПЕРЕДАЁМ ФЛАГ
+
+                char final_buf[1024];
+                bool was_stopped = stop_flag.load();
+                snprintf(final_buf, sizeof(final_buf),
+                    "data: {\"done\":true,"
+                    "\"generated_tokens\":%d,"
+                    "\"prefill_time_sec\":%.4f,"
+                    "\"generation_time_sec\":%.4f,"
+                    "\"finish_reason\":\"%s\"}\n\n",
+                    r.generated_tokens, r.prefill_time, r.gen_time,
+                    was_stopped ? "stop" : r.finish_reason.c_str());
+                write(item.client_fd, final_buf, strlen(final_buf));
+
+            } else {
+                auto r = generate(model_, &s, ids, n, item.request.max_tokens,
+                                item.request.temperature, item.request.top_k,
+                                item.request.top_p, item.request.rep_p,
+                                item.request.ignore_eos, false, &stop_flag);
+
+                std::string resp = build_json_response(r, item.request.prompt);
+                // Добавляем stopped флаг в ответ
+                if (stop_flag.load()) {
+                    // Вставляем stopped:true перед последней }
+                    resp.insert(resp.size() - 1, ",\"stopped\":true");
+                }
+
+                char header[512];
+                int blen = (int)resp.size();
+                int hlen = snprintf(header, sizeof(header),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %d\r\n"
+                    "Connection: close\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "\r\n", blen);
+                write(item.client_fd, header, hlen);
+                if (blen > 0) write(item.client_fd, resp.c_str(), blen);
+            }
+
             free_state(&s);
+            
+            // Убираем флаг
+            if (!req_id.empty()) {
+                std::lock_guard<std::mutex> lock(g_stop_mutex);
+                g_stop_flags.erase(req_id);
+            }
 
-            // Отправляем ответ
-            char header[512];
-            int blen = (int)resp.size();
-            int hlen = snprintf(header, sizeof(header),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "\r\n", blen);
-            write(item.client_fd, header, hlen);
-            if (blen > 0) write(item.client_fd, resp.c_str(), blen);
             close(item.client_fd);
-
             printf("[%s] POST /generate → 200 (%.2fs)\n",
-                   item.client_ip.c_str(), time_sec() - ts0);
+                item.client_ip.c_str(), time_sec() - ts0);
             fflush(stdout);
         }
     }
@@ -369,6 +455,47 @@ static void run_server(Model *m, int port, int default_max,
                 m->layers[0].q_proj.fmt==WF_Q8?"q8":"f32");
             http_respond(cli_fd, 200, "OK", "application/json", hbuf);
             printf(" → 200\n");
+            close(cli_fd);
+        }
+
+        // После блока /health добавить:
+        else if (!strcmp(path_buf,"/stop") && !strcmp(method,"POST")) {
+            auto sreq = parse_server_request(body, body_len);
+            std::string req_id = sreq.request_id;
+            
+            bool stopped = false;
+            if (!req_id.empty()) {
+                std::lock_guard<std::mutex> lock(g_stop_mutex);
+                auto it = g_stop_flags.find(req_id);
+                if (it != g_stop_flags.end()) {
+                    it->second->store(true);
+                    stopped = true;
+                }
+            }
+            
+            char resp[128];
+            snprintf(resp, sizeof(resp), 
+                "{\"stopped\":%s,\"request_id\":\"%s\"}",
+                stopped ? "true" : "false", req_id.c_str());
+            http_respond(cli_fd, 200, "OK", "application/json", resp);
+            printf(" → 200\n");
+            close(cli_fd);
+        }
+
+        else if ((!strcmp(path_buf,"/") || !strcmp(path_buf,"/chat.html")) && !strcmp(method,"GET")) {
+            const char *html = webui::get_chat_html();
+            int blen = strlen(html);
+            char header[512];
+            int hlen = snprintf(header, sizeof(header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n", blen);
+            write(cli_fd, header, hlen);
+            write(cli_fd, html, blen);
+            printf(" → 200 (web UI)\n");
             close(cli_fd);
         }
         else if (!strcmp(path_buf,"/generate") && !strcmp(method,"POST")) {
